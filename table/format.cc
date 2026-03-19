@@ -4,6 +4,8 @@
 
 #include "table/format.h"
 
+#include <limits>
+
 #include "leveldb/env.h"
 #include "leveldb/options.h"
 #include "port/port.h"
@@ -13,6 +15,10 @@
 
 namespace leveldb {
 
+namespace {
+// Reader-side safety cap for both compressed and decompressed block payloads.
+static constexpr size_t kMaxBlockBytes = 256u * 1024u * 1024u;
+}  // namespace
 void BlockHandle::EncodeTo(std::string* dst) const {
   // Sanity check that all fields have been set
   assert(offset_ != ~static_cast<uint64_t>(0));
@@ -74,15 +80,25 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
 
   // Read the block contents as well as the type/crc footer.
   // See table_builder.cc for the code that built this structure.
+
   size_t n = static_cast<size_t>(handle.size());
-  char* buf = new char[n + kBlockTrailerSize];
+
+  if (n > kMaxBlockBytes) {
+    return Status::Corruption("bad block size");
+  }
+  if (n > std::numeric_limits<size_t>::max() - kBlockTrailerSize) {
+    return Status::Corruption("bad block size overflow");
+  }
+  const size_t block_plus_trailer = n + kBlockTrailerSize;
+
+  char* buf = new char[block_plus_trailer];
   Slice contents;
-  Status s = file->Read(handle.offset(), n + kBlockTrailerSize, &contents, buf);
+  Status s = file->Read(handle.offset(), block_plus_trailer, &contents, buf);
   if (!s.ok()) {
     delete[] buf;
     return s;
   }
-  if (contents.size() != n + kBlockTrailerSize) {
+  if (contents.size() != block_plus_trailer) {
     delete[] buf;
     return Status::Corruption("truncated block read");
   }
@@ -123,6 +139,10 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
         delete[] buf;
         return Status::Corruption("corrupted snappy compressed block length");
       }
+      if (ulength > kMaxBlockBytes) {
+        delete[] buf;
+        return Status::Corruption("snappy block too large");
+      }
       char* ubuf = new char[ulength];
       if (!port::Snappy_Uncompress(data, n, ubuf)) {
         delete[] buf;
@@ -140,6 +160,10 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
       if (!port::Zstd_GetUncompressedLength(data, n, &ulength)) {
         delete[] buf;
         return Status::Corruption("corrupted zstd compressed block length");
+      }
+      if (ulength > kMaxBlockBytes) {
+        delete[] buf;
+        return Status::Corruption("zstd block too large");
       }
       char* ubuf = new char[ulength];
       if (!port::Zstd_Uncompress(data, n, ubuf)) {
