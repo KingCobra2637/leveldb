@@ -145,6 +145,22 @@ class LEVELDB_EXPORT DB {
   // Therefore the following call will compact the entire database:
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
+
+  // Perform a synchronous full compaction over the entire database.  The
+  // active memtable is flushed and every level is compacted into the next,
+  // from level 0 toward the deepest level, so that obsolete entries and
+  // tombstones are discarded.  Returns only after the full compaction has
+  // completed.
+  //
+  // While this call is in progress the database behaves as temporarily
+  // unavailable for regular read/write requests: concurrent Put/Delete/Write
+  // and Get calls on any thread block until the compaction finishes.
+  //
+  // A human-readable summary of the compaction work is written to the DB's
+  // info log (options.info_log) when the call completes.
+  virtual Status ForceFullCompaction() {
+    return Status::NotSupported(Slice("ForceFullCompaction()"));
+  }
 };
 
 // Destroy the contents of the specified database.
