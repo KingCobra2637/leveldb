@@ -48,6 +48,7 @@ class DBImpl : public DB {
   bool GetProperty(const Slice& property, std::string* value) override;
   void GetApproximateSizes(const Range* range, int n, uint64_t* sizes) override;
   void CompactRange(const Slice* begin, const Slice* end) override;
+  Status ForceFullCompaction() override;
 
   // Extra methods (for testing) that are not in the public DB interface
 
@@ -88,17 +89,32 @@ class DBImpl : public DB {
   // Per level compaction stats.  stats_[level] stores the stats for
   // compactions that produced data for the specified "level".
   struct CompactionStats {
-    CompactionStats() : micros(0), bytes_read(0), bytes_written(0) {}
+    CompactionStats()
+        : micros(0),
+          bytes_read(0),
+          bytes_written(0),
+          num_compactions(0),
+          num_input_files(0),
+          num_output_files(0) {}
 
     void Add(const CompactionStats& c) {
       this->micros += c.micros;
       this->bytes_read += c.bytes_read;
       this->bytes_written += c.bytes_written;
+      this->num_compactions += c.num_compactions;
+      this->num_input_files += c.num_input_files;
+      this->num_output_files += c.num_output_files;
     }
 
     int64_t micros;
     int64_t bytes_read;
     int64_t bytes_written;
+    // Counters added for ForceFullCompaction reporting.  They are carried
+    // alongside the existing byte/time metrics so that every compaction site
+    // that already calls stats_[lvl].Add(...) automatically propagates them.
+    int64_t num_compactions;
+    int64_t num_input_files;
+    int64_t num_output_files;
   };
 
   Iterator* NewInternalIterator(const ReadOptions&,
@@ -194,6 +210,16 @@ class DBImpl : public DB {
 
   // Has a background compaction been scheduled or is running?
   bool background_compaction_scheduled_ GUARDED_BY(mutex_);
+
+  // Gate used by ForceFullCompaction to make the DB behave as temporarily
+  // unavailable for foreground reads/writes.  When true, every entry into
+  // Get()/Write() parks on force_compaction_done_signal_ until the force
+  // compaction clears the flag.  The thread that owns the force compaction
+  // is self-exempt via the thread_local flag below; without that exemption
+  // the force thread would deadlock waiting on its own gate when it calls
+  // TEST_CompactMemTable (which goes through Write()).
+  bool force_compaction_in_progress_ GUARDED_BY(mutex_);
+  port::CondVar force_compaction_done_signal_ GUARDED_BY(mutex_);
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 

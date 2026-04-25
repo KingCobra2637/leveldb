@@ -39,6 +39,25 @@ namespace leveldb {
 
 const int kNumNonTableCacheFiles = 10;
 
+namespace {
+// Per-thread self-exemption flag for the force-compaction gate.  When a thread
+// is driving DBImpl::ForceFullCompaction() it sets this to true so that its
+// own internal calls to Write()/Get() (e.g. TEST_CompactMemTable sends a null
+// batch through Write()) skip the gate and avoid self-deadlock.  Other threads
+// see it as false and block on force_compaction_done_signal_ as normal.
+thread_local bool t_is_force_compaction_thread_ = false;
+
+// RAII helper that sets/clears t_is_force_compaction_thread_ on the current
+// thread for the duration of a scope.
+class ScopedForceThread {
+ public:
+  ScopedForceThread() { t_is_force_compaction_thread_ = true; }
+  ~ScopedForceThread() { t_is_force_compaction_thread_ = false; }
+  ScopedForceThread(const ScopedForceThread&) = delete;
+  ScopedForceThread& operator=(const ScopedForceThread&) = delete;
+};
+}  // namespace
+
 // Information kept for every waiting writer
 struct DBImpl::Writer {
   explicit Writer(port::Mutex* mu)
@@ -145,6 +164,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       seed_(0),
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
+      force_compaction_in_progress_(false),
+      force_compaction_done_signal_(&mutex_),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
@@ -542,6 +563,11 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
+  // Memtable flush: count it as one compaction with no on-disk inputs and
+  // at most one output file (zero if file_size == 0 and we skipped AddFile).
+  stats.num_compactions = 1;
+  stats.num_input_files = 0;
+  stats.num_output_files = (s.ok() && meta.file_size > 0) ? 1 : 0;
   stats_[level].Add(stats);
   return s;
 }
@@ -594,6 +620,145 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
   for (int level = 0; level < max_level_with_files; level++) {
     TEST_CompactRange(level, begin, end);
   }
+}
+
+Status DBImpl::ForceFullCompaction() {
+  // --- 1) Serialize with any other force compaction, then raise the gate ---
+  //
+  // force_compaction_in_progress_ makes Get/Write/NewInternalIterator on
+  // OTHER threads block until this call finishes (the "DB temporarily
+  // unavailable" contract).  The inner while-loop also serializes two
+  // concurrent ForceFullCompaction callers; the second one parks here
+  // until the first clears the flag.
+  {
+    MutexLock l(&mutex_);
+    while (force_compaction_in_progress_ &&
+           !shutting_down_.load(std::memory_order_acquire)) {
+      force_compaction_done_signal_.Wait();
+    }
+    if (shutting_down_.load(std::memory_order_acquire)) {
+      return Status::IOError("DB is shutting down");
+    }
+    force_compaction_in_progress_ = true;
+  }
+
+  // --- 2) Self-exempt this thread from the gate ------------------------
+  //
+  // TEST_CompactMemTable calls Write(opts, nullptr), which hits the gate we
+  // just raised.  Without this thread-local exemption the force thread
+  // would block on its own gate -> deadlock.  RAII guarantees the flag is
+  // cleared even on early return / exception.
+  ScopedForceThread force_scope;
+
+  // --- 3) Snapshot per-level stats so we can report just this call's work
+  CompactionStats before[config::kNumLevels];
+  {
+    MutexLock l(&mutex_);
+    for (int i = 0; i < config::kNumLevels; i++) before[i] = stats_[i];
+  }
+  const uint64_t start_micros = env_->NowMicros();
+
+  // --- 4) Flush the active memtable --------------------------------------
+  //
+  // TEST_CompactMemTable sends a null batch through the writer queue, which
+  // serves as a fence: any writers that were admitted before we raised the
+  // gate drain first (we sit at the tail of writers_).  Then it waits until
+  // the background thread has written imm_ to L0.  If a bg compaction was
+  // already running when the force call started, this wait is where we sit
+  // until it finishes, because the bg thread runs one task at a time.
+  Status s = TEST_CompactMemTable();
+
+  // --- 5) Walk every level, compacting L -> L+1 sequentially -------------
+  //
+  // We stop at kNumLevels-2 because compacting level (kNumLevels-1) would
+  // need a level (kNumLevels) that does not exist.  Each TEST_CompactRange
+  // installs a ManualCompaction and waits on background_work_finished_
+  // signal_ until the bg thread marks it done.  Automatic compactions
+  // (e.g. seek-triggered from a Get that was admitted before the gate)
+  // may interleave between iterations; this extends wall-clock time but
+  // does not violate correctness and is captured by the stats diff below.
+  for (int level = 0;
+       s.ok() && level + 1 < config::kNumLevels &&
+       !shutting_down_.load(std::memory_order_acquire);
+       ++level) {
+    TEST_CompactRange(level, /*begin=*/nullptr, /*end=*/nullptr);
+    MutexLock l(&mutex_);
+    if (!bg_error_.ok()) s = bg_error_;
+  }
+
+  // --- 6) Compute the per-call stats by diffing the snapshot -------------
+  CompactionStats total;
+  CompactionStats per_level[config::kNumLevels];
+  {
+    MutexLock l(&mutex_);
+    for (int i = 0; i < config::kNumLevels; i++) {
+      per_level[i].micros = stats_[i].micros - before[i].micros;
+      per_level[i].bytes_read = stats_[i].bytes_read - before[i].bytes_read;
+      per_level[i].bytes_written =
+          stats_[i].bytes_written - before[i].bytes_written;
+      per_level[i].num_compactions =
+          stats_[i].num_compactions - before[i].num_compactions;
+      per_level[i].num_input_files =
+          stats_[i].num_input_files - before[i].num_input_files;
+      per_level[i].num_output_files =
+          stats_[i].num_output_files - before[i].num_output_files;
+      total.Add(per_level[i]);
+    }
+  }
+
+  const double elapsed_sec = (env_->NowMicros() - start_micros) / 1e6;
+
+  // --- 7) Emit a human-readable summary to the DB's info log -------------
+  {
+    char buf[512];
+    std::string out;
+    std::snprintf(buf, sizeof(buf),
+                  "\n==== ForceFullCompaction summary (%.3f s) ====\n"
+                  "Compactions executed : %lld\n"
+                  "Input  files         : %lld\n"
+                  "Output files         : %lld\n"
+                  "Bytes read           : %lld (%.2f MiB)\n"
+                  "Bytes written        : %lld (%.2f MiB)\n"
+                  "Per-level breakdown:\n"
+                  "  Lvl  comp  in   out    read(MiB)   write(MiB)\n",
+                  elapsed_sec,
+                  static_cast<long long>(total.num_compactions),
+                  static_cast<long long>(total.num_input_files),
+                  static_cast<long long>(total.num_output_files),
+                  static_cast<long long>(total.bytes_read),
+                  total.bytes_read / 1048576.0,
+                  static_cast<long long>(total.bytes_written),
+                  total.bytes_written / 1048576.0);
+    out = buf;
+    for (int i = 0; i < config::kNumLevels; i++) {
+      if (per_level[i].num_compactions == 0 && per_level[i].bytes_read == 0 &&
+          per_level[i].bytes_written == 0) {
+        continue;
+      }
+      std::snprintf(buf, sizeof(buf),
+                    "  %3d  %4lld  %3lld  %4lld    %9.2f    %9.2f\n", i,
+                    static_cast<long long>(per_level[i].num_compactions),
+                    static_cast<long long>(per_level[i].num_input_files),
+                    static_cast<long long>(per_level[i].num_output_files),
+                    per_level[i].bytes_read / 1048576.0,
+                    per_level[i].bytes_written / 1048576.0);
+      out += buf;
+    }
+    Log(options_.info_log, "%s", out.c_str());
+    // Also echo to stderr so simple binaries/tests see it without tailing
+    // the info log.
+    std::fwrite(out.data(), 1, out.size(), stderr);
+    std::fflush(stderr);
+  }
+
+  // --- 8) Lower the gate and wake everyone parked on it ------------------
+  {
+    MutexLock l(&mutex_);
+    force_compaction_in_progress_ = false;
+    force_compaction_done_signal_.SignalAll();
+  }
+  // ScopedForceThread clears t_is_force_compaction_thread_ on scope exit.
+  return s;
 }
 
 void DBImpl::TEST_CompactRange(int level, const Slice* begin,
@@ -751,6 +916,18 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->number), c->level() + 1,
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
+    // Trivial move: one input file reassigned to the next level.  Previously
+    // no stats were recorded here; count it as one compaction so the new
+    // ForceFullCompaction reporter (and the existing "leveldb.stats"
+    // property) sees the work.
+    if (status.ok()) {
+      CompactionStats trivial_stats;
+      trivial_stats.num_compactions = 1;
+      trivial_stats.num_input_files = 1;
+      trivial_stats.num_output_files = 1;
+      trivial_stats.bytes_written = f->file_size;
+      stats_[c->level() + 1].Add(trivial_stats);
+    }
   } else {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
@@ -1033,8 +1210,12 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
+  stats.num_compactions = 1;
+  stats.num_output_files = static_cast<int64_t>(compact->outputs.size());
   for (int which = 0; which < 2; which++) {
-    for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+    const int n = compact->compaction->num_input_files(which);
+    stats.num_input_files += n;
+    for (int i = 0; i < n; i++) {
       stats.bytes_read += compact->compaction->input(which, i)->file_size;
     }
   }
@@ -1084,6 +1265,12 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
                                       SequenceNumber* latest_snapshot,
                                       uint32_t* seed) {
   mutex_.Lock();
+  // ForceFullCompaction gate: iterators are a form of read, so hold creation
+  // until any concurrent force compaction finishes.
+  while (force_compaction_in_progress_ && !t_is_force_compaction_thread_ &&
+         !shutting_down_.load(std::memory_order_acquire)) {
+    force_compaction_done_signal_.Wait();
+  }
   *latest_snapshot = versions_->LastSequence();
 
   // Collect together all needed child iterators
@@ -1122,6 +1309,13 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
                    std::string* value) {
   Status s;
   MutexLock l(&mutex_);
+  // ForceFullCompaction gate: while a force compaction is running on another
+  // thread, make the DB behave as temporarily unavailable for regular reads.
+  // The force thread itself is exempt via t_is_force_compaction_thread_.
+  while (force_compaction_in_progress_ && !t_is_force_compaction_thread_ &&
+         !shutting_down_.load(std::memory_order_acquire)) {
+    force_compaction_done_signal_.Wait();
+  }
   SequenceNumber snapshot;
   if (options.snapshot != nullptr) {
     snapshot =
@@ -1210,6 +1404,16 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   w.done = false;
 
   MutexLock l(&mutex_);
+  // ForceFullCompaction gate: hold foreground writers outside the writer
+  // queue for the duration of a concurrent force compaction.  We must do
+  // this BEFORE writers_.push_back(&w); otherwise a blocked writer would
+  // occupy a queue slot and could reach MakeRoomForWrite while the force
+  // compaction is still manipulating the memtable.  The force thread
+  // itself is exempt so its own TEST_CompactMemTable call can proceed.
+  while (force_compaction_in_progress_ && !t_is_force_compaction_thread_ &&
+         !shutting_down_.load(std::memory_order_acquire)) {
+    force_compaction_done_signal_.Wait();
+  }
   writers_.push_back(&w);
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
