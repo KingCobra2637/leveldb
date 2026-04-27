@@ -78,12 +78,16 @@ class LEVELDB_EXPORT DB {
   virtual Status Scan(const ReadOptions& options,
                       const Slice& start_key,
                       const Slice& end_key,
-                      std::vector<std::pair<std::string, std::string>>* result) = 0;
+                      std::vector<std::pair<std::string, std::string>>* result) {
+    return Status::NotSupported(Slice("Scan()"));
+  };
 
   // Adding the DeleteRange API.
   virtual Status DeleteRange(const WriteOptions& options,
                              const Slice& start_key,
-                             const Slice& end_key) = 0;  
+                             const Slice& end_key) {
+    return Status::NotSupported(Slice("DeleteRange()"));
+  };  
 
   // Apply the specified updates to the database.
   // Returns OK on success, non-OK on failure.
