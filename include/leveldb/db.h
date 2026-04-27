@@ -72,6 +72,17 @@ class LEVELDB_EXPORT DB {
   // Note: consider setting options.sync = true.
   virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
 
+  // Retrieves all key-value pairs in the half-open interval [start_key, end_key).
+  virtual Status Scan(const ReadOptions& options,
+                      const Slice& start_key,
+                      const Slice& end_key,
+                      std::vector<std::pair<std::string, std::string>>* result) = 0;
+
+  // Adding the DeleteRange API.
+  virtual Status DeleteRange(const WriteOptions& options,
+                             const Slice& start_key,
+                             const Slice& end_key) = 0;  
+
   // Apply the specified updates to the database.
   // Returns OK on success, non-OK on failure.
   // Note: consider setting options.sync = true.

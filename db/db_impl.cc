@@ -1295,6 +1295,72 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
 }
 
+Status DBImpl::Scan(const ReadOptions& options,
+                    const Slice& start_key,
+                    const Slice& end_key,
+                    std::vector<std::pair<std::string, std::string>>* result) {
+
+  // 1. Create a new iterator. This is thread-safe and creates a consistent snapshot.
+  Iterator* it = NewIterator(options);
+  
+  // 2. Seek to the start_key. The iterator will jump to the first key >= start_key.
+  for (it->Seek(start_key); it->Valid(); it->Next()) {
+    
+    // 3. Check if we have hit or crossed the end_key.
+    // We use the user_comparator() instead of standard string comparison 
+    // to ensure we respect any custom sorting rules the database was initialized with.
+    if (user_comparator()->Compare(it->key(), end_key) >= 0) {
+      break; // Stop scanning, as we've reached the upper bound of [start_key, end_key)
+    }
+    
+    // 4. Extract the data. 
+    // Since Slice only points to external byte arrays, we must convert 
+    // them to std::string to safely store them in the result vector.
+    result->push_back(std::make_pair(it->key().ToString(), it->value().ToString()));
+  }
+  
+  // 5. Catch any IO or corruption errors that might have occurred during disk reads.
+  Status s = it->status();
+  
+  // 6. Clean up the iterator to prevent memory leaks and release the internal snapshot.
+  delete it;
+  
+  return s;
+}
+
+Status DBImpl::DeleteRange(const WriteOptions& options,
+                           const Slice& start_key,
+                           const Slice& end_key) {
+  WriteBatch batch;
+  
+  // 1. Create a standard read-only iterator
+  Iterator* it = NewIterator(ReadOptions());
+  
+  // 2. Walk through the half-open interval [start_key, end_key)
+  for (it->Seek(start_key); it->Valid(); it->Next()) {
+    
+    // Check if we reached the end boundary
+    if (user_comparator()->Compare(it->key(), end_key) >= 0) {
+      break;
+    }
+    
+    // 3. Add a deletion tombstone for each key found
+    batch.Delete(it->key());
+  }
+
+  // 4. Catch any disk reading errors
+  Status s = it->status();
+  delete it;
+
+  if (!s.ok()) {
+    return s;
+  }
+
+  // 5. Commit the batch. LevelDB will automatically grab its internal 
+  // master lock here, safely applying all tombstones to the MemTable.
+  return this->Write(options, &batch);
+}
+
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   Writer w(&mutex_);
   w.batch = updates;
