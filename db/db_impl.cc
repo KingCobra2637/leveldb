@@ -27,6 +27,8 @@
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+#include "leveldb/write_batch.h"
+#include "leveldb/iterator.h"
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"

@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>
+#include <string>
 
 #include "leveldb/export.h"
 #include "leveldb/iterator.h"
